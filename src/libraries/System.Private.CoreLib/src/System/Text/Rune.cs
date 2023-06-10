@@ -2,10 +2,17 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System.Buffers;
+using System.Buffers.Binary;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
+using System.IO;
+using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics.Arm;
+using System.Runtime.Intrinsics.X86;
 using System.Text.Unicode;
 
 namespace System.Text
@@ -355,7 +362,7 @@ namespace System.Text
             result = ReplacementChar;
             return OperationStatus.NeedMoreData;
 
-        InvalidData:
+            InvalidData:
 
             charsConsumed = 1; // maximal invalid subsequence for UTF-16 is always a single code unit in length
             result = ReplacementChar;
@@ -396,155 +403,118 @@ namespace System.Text
             // it tries to consume as many code units as possible as long as those code
             // units constitute the beginning of a longer well-formed subsequence per Table 3-7.
 
-            // Try reading source[0].
-
-            int index = 0;
-            if (source.IsEmpty)
+            // Try reading source[0..3] or source[0..] whichever shorter.
+            const int MaximumSequenceLength = 4;
+            ReadOnlySpan<byte> tempSource = source;
+            uint tempValue = 0;
+            // oneByteFailureMask is used for a sign to find out that it fails at first byte.
+            int oneByteFailureMask = ~0;
+            OperationStatus tempStatus = OperationStatus.InvalidData;
+            ref byte sourceHead = ref MemoryMarshal.GetReference(tempSource);
+            int shift = 32;
+            int bytesRead = 0;
+            nint index = 0;
+            switch (tempSource.Length)
             {
-                goto NeedsMoreData;
+                case 0:
+                    tempStatus = OperationStatus.NeedMoreData;
+                    oneByteFailureMask = 0;
+                    goto Finish;
+                case >= 4:
+                    tempValue = BinaryPrimitives.ReadUInt32BigEndian(tempSource);
+                    shift = 0;
+                    bytesRead = 4;
+                    break;
+                case 3:
+                    shift -= 8;
+                    tempValue |= (uint)Unsafe.AddByteOffset(ref sourceHead, index++) << shift;
+                    bytesRead++;
+                    goto case 2;
+                case 2:
+                    shift -= 8;
+                    tempValue |= (uint)Unsafe.AddByteOffset(ref sourceHead, index++) << shift;
+                    bytesRead++;
+                    goto case 1;
+                case 1:
+                    shift -= 8;
+                    tempValue |= (uint)Unsafe.AddByteOffset(ref sourceHead, index++) << shift;
+                    bytesRead++;
+                    break;
             }
-
-            uint tempValue = source[0];
-            if (UnicodeUtility.IsAsciiCodePoint(tempValue))
+            // Here `shift` represents how many trailing bits are not loaded.
+            // `shift` should be 32 if source were empty.
+            int sequenceLength = BitOperations.LeadingZeroCount(~tempValue);
+            // This checks if the sequenceLength is either 0, 2, 3, and 4.
+            if (((~0b0001_1101L >> sequenceLength) & 1) > 0)
             {
-                bytesConsumed = 1;
-                result = UnsafeCreate(tempValue);
-                return OperationStatus.Done;
+                goto Finish;
             }
+            uint tempZeroMask = ~0u >> (sequenceLength + 1);
+            tempValue |= (0x8080_8080u >> -shift) & (uint)-Unsafe.BitCast<bool, byte>(shift != 0);
+            // Here it converts 0 to 1, while letting anything else as it is.
+            sequenceLength += (int)(uint)Unsafe.BitCast<bool, byte>(sequenceLength == 0);
+            int unneccesaryLowBits = 8 * (MaximumSequenceLength - sequenceLength);
+            uint validationMask = 0x00ff_ffffu & (0xc0c0_c0c0u << unneccesaryLowBits);
+            uint validationValue = validationMask & 0x8080_8080u;
+            uint pextMask = (0x3f3f3f3fu << unneccesaryLowBits) & tempZeroMask;
 
-            // Per Table 3-7, the beginning of a multibyte sequence must be a code unit in
-            // the range [C2..F4]. If it's outside of that range, it's either a standalone
-            // continuation byte, or it's an overlong two-byte sequence, or it's an out-of-range
-            // four-byte sequence.
-
-            // Try reading source[1].
-
-            index = 1;
-            if (!UnicodeUtility.IsInRangeInclusive(tempValue, 0xC2, 0xF4))
+            // Detecting invalid continuation sequence
+            if ((validationMask & tempValue) != validationValue)
             {
-                goto Invalid;
+                goto InvalidContinuation;
             }
-
-            tempValue = (tempValue - 0xC2) << 6;
-
-            if (source.Length <= 1)
+            // Decoding
+            if (Bmi2.IsSupported)
             {
-                goto NeedsMoreData;
+                tempValue = Bmi2.ParallelBitExtract(tempValue, pextMask);
             }
-
-            // Continuation bytes are of the form [10xxxxxx], which means that their two's
-            // complement representation is in the range [-65..-128]. This allows us to
-            // perform a single comparison to see if a byte is a continuation byte.
-
-            int thisByteSignExtended = (sbyte)source[1];
-            if (thisByteSignExtended >= -64)
+            else
             {
-                goto Invalid;
+                tempValue &= tempZeroMask;
+                uint tempCopy = tempValue;
+                tempValue = tempCopy & 0x3f;
+                tempValue |= (tempCopy & 0x3f_00) >> 2;
+                tempValue |= (tempCopy & 0x3f_00_00) >> 4;
+                tempValue |= (tempCopy & 0x3f_00_00_00) >> 6;
+                tempValue >>= 6 * (4 - sequenceLength);
             }
+            // Range check
+            bool isSourceTooShort = bytesRead < sequenceLength;
+            int sourceNotTooShortMask = Unsafe.BitCast<bool, byte>(isSourceTooShort) - 1;
+            bytesRead &= ~sourceNotTooShortMask;
+            bytesRead |= sequenceLength & sourceNotTooShortMask;
+            bool isValid = UnicodeUtility.IsValidUnicodeScalar(tempValue);
+            // Overlong check
+            const ulong OverlongThresholdShiftValues = 0x10_0B_07_00_00;
+            uint overlongThreshold = (uint)Unsafe.BitCast<bool, byte>(sequenceLength > 1) << (byte)(OverlongThresholdShiftValues >> 8 * sequenceLength);
+            isValid &= tempValue >= overlongThreshold;
+            int isValidBit = Unsafe.BitCast<bool, byte>(isValid);
+            oneByteFailureMask += isValidBit;
+            int tableShift = 8 * (Unsafe.BitCast<bool, byte>(isSourceTooShort) * 2 + isValidBit);
+            const uint StatusTable = ((uint)OperationStatus.NeedMoreData << 24) | ((uint)OperationStatus.InvalidData << 16) | ((uint)OperationStatus.Done << 8) | (uint)OperationStatus.InvalidData;
+            tempStatus = (OperationStatus)(byte)(StatusTable >> tableShift);
 
-            tempValue += (uint)thisByteSignExtended;
-            tempValue += 0x80; // remove the continuation byte marker
-            tempValue += (0xC2 - 0xC0) << 6; // remove the leading byte marker
+            Finish:
 
-            if (tempValue < 0x0800)
-            {
-                Debug.Assert(UnicodeUtility.IsInRangeInclusive(tempValue, 0x0080, 0x07FF));
-                goto Finish; // this is a valid 2-byte sequence
-            }
-
-            // This appears to be a 3- or 4-byte sequence. Since per Table 3-7 we now have
-            // enough information (from just two code units) to detect overlong or surrogate
-            // sequences, we need to perform these checks now.
-
-            if (!UnicodeUtility.IsInRangeInclusive(tempValue, ((0xE0 - 0xC0) << 6) + (0xA0 - 0x80), ((0xF4 - 0xC0) << 6) + (0x8F - 0x80)))
-            {
-                // The first two bytes were not in the range [[E0 A0]..[F4 8F]].
-                // This is an overlong 3-byte sequence or an out-of-range 4-byte sequence.
-                goto Invalid;
-            }
-
-            if (UnicodeUtility.IsInRangeInclusive(tempValue, ((0xED - 0xC0) << 6) + (0xA0 - 0x80), ((0xED - 0xC0) << 6) + (0xBF - 0x80)))
-            {
-                // This is a UTF-16 surrogate code point, which is invalid in UTF-8.
-                goto Invalid;
-            }
-
-            if (UnicodeUtility.IsInRangeInclusive(tempValue, ((0xF0 - 0xC0) << 6) + (0x80 - 0x80), ((0xF0 - 0xC0) << 6) + (0x8F - 0x80)))
-            {
-                // This is an overlong 4-byte sequence.
-                goto Invalid;
-            }
-
-            // The first two bytes were just fine. We don't need to perform any other checks
-            // on the remaining bytes other than to see that they're valid continuation bytes.
-
-            // Try reading source[2].
-
-            index = 2;
-            if (source.Length <= 2)
-            {
-                goto NeedsMoreData;
-            }
-
-            thisByteSignExtended = (sbyte)source[2];
-            if (thisByteSignExtended >= -64)
-            {
-                goto Invalid; // this byte is not a UTF-8 continuation byte
-            }
-
-            tempValue <<= 6;
-            tempValue += (uint)thisByteSignExtended;
-            tempValue += 0x80; // remove the continuation byte marker
-            tempValue -= (0xE0 - 0xC0) << 12; // remove the leading byte marker
-
-            if (tempValue <= 0xFFFF)
-            {
-                Debug.Assert(UnicodeUtility.IsInRangeInclusive(tempValue, 0x0800, 0xFFFF));
-                goto Finish; // this is a valid 3-byte sequence
-            }
-
-            // Try reading source[3].
-
-            index = 3;
-            if (source.Length <= 3)
-            {
-                goto NeedsMoreData;
-            }
-
-            thisByteSignExtended = (sbyte)source[3];
-            if (thisByteSignExtended >= -64)
-            {
-                goto Invalid; // this byte is not a UTF-8 continuation byte
-            }
-
-            tempValue <<= 6;
-            tempValue += (uint)thisByteSignExtended;
-            tempValue += 0x80; // remove the continuation byte marker
-            tempValue -= (0xF0 - 0xE0) << 18; // remove the leading byte marker
-
-            // Valid 4-byte sequence
-            UnicodeDebug.AssertIsValidSupplementaryPlaneScalar(tempValue);
-
-        Finish:
-
-            bytesConsumed = index + 1;
-            Debug.Assert(1 <= bytesConsumed && bytesConsumed <= 4); // Valid subsequences are always length [1..4]
+            uint imcompleteMask = (uint)-Unsafe.BitCast<bool, byte>(tempStatus != OperationStatus.Done);
+            tempValue &= ~imcompleteMask;
+            tempValue |= imcompleteMask & UnicodeUtility.ReplacementChar;
             result = UnsafeCreate(tempValue);
-            return OperationStatus.Done;
+            bytesRead &= ~oneByteFailureMask;
+            bytesRead -= oneByteFailureMask;
+            bytesConsumed = bytesRead;
+            return tempStatus;
 
-        NeedsMoreData:
-
-            Debug.Assert(0 <= index && index <= 3); // Incomplete subsequences are always length 0..3
-            bytesConsumed = index;
+            InvalidContinuation:
+            // Find first byte to be non-continuation byte
             result = ReplacementChar;
-            return OperationStatus.NeedMoreData;
-
-        Invalid:
-
-            Debug.Assert(1 <= index && index <= 3); // Invalid subsequences are always length 1..3
-            bytesConsumed = index;
-            result = ReplacementChar;
-            return OperationStatus.InvalidData;
+            uint highestBitMasked = tempValue;
+            // Make sure the second highest bit in each bytes are not set.
+            highestBitMasked &= ~(tempValue << 1);
+            highestBitMasked &= 0x0080_8080;
+            highestBitMasked ^= 0x0080_8080;
+            bytesConsumed = BitOperations.LeadingZeroCount(highestBitMasked) >>> 3;
+            return tempStatus;
         }
 
         /// <summary>
@@ -668,7 +638,7 @@ namespace System.Text
                     }
                 }
 
-            Invalid:
+                Invalid:
 
                 // If we got to this point, either:
                 // - the last 4 bytes of the input buffer are continuation bytes;
@@ -683,7 +653,7 @@ namespace System.Text
                 bytesConsumed = 1;
                 return OperationStatus.InvalidData;
 
-            ForwardDecode:
+                ForwardDecode:
 
                 // If we got to this point, we found an ASCII byte or a UTF-8 starting byte at position source[index].
                 // Technically this could also mean we found an invalid byte like C0 or F5 at this position, but that's

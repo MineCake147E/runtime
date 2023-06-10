@@ -237,14 +237,16 @@ namespace System.Text.Tests
         [InlineData(new byte[] { 0xF4, 0x90 }, OperationStatus.InvalidData, 0xFFFD, 1)] // [ F4 90 ] would place us beyond U+10FFFF, all such sequences have maximal invalid subsequence length 1
         [InlineData(new byte[] { 0xE2, 0x88, 0xB4 }, OperationStatus.Done, 0x2234, 3)] // [ E2 88 B4 ] is U+2234 THEREFORE
         [InlineData(new byte[] { 0xE2, 0x88, 0xC0 }, OperationStatus.InvalidData, 0xFFFD, 2)] // [ E2 88 ] followed by non-continuation byte, maximal invalid subsequence length 2
+        [InlineData(new byte[] { 0xE2, 0x20, 0x88 }, OperationStatus.InvalidData, 0xFFFD, 1)] // [ E2 ] followed by non-continuation byte, despite it's meant to be 3-byte sequence, invalid subsequence length 1
         [InlineData(new byte[] { 0xF0, 0x9F, 0x98 }, OperationStatus.NeedMoreData, 0xFFFD, 3)] // [ F0 9F 98 ] is valid 3-byte start of 4-byte sequence
         [InlineData(new byte[] { 0xF0, 0x9F, 0x98, 0x20 }, OperationStatus.InvalidData, 0xFFFD, 3)] // [ F0 9F 98 ] followed by non-continuation byte, maximal invalid subsequence length 3
+        [InlineData(new byte[] { 0xF0, 0x9F, 0x20, 0x90 }, OperationStatus.InvalidData, 0xFFFD, 2)] // [ F0 9F ] followed by non-continuation byte, despite it's meant to be 4-byte sequence, invalid subsequence length 2
+        [InlineData(new byte[] { 0xF0, 0x20, 0x90, 0x90 }, OperationStatus.InvalidData, 0xFFFD, 1)] // [ F0 ] followed by non-continuation byte, despite it's meant to be 4-byte sequence, invalid subsequence length 1
         [InlineData(new byte[] { 0xF0, 0x9F, 0x98, 0xB2 }, OperationStatus.Done, 0x1F632, 4)] // [ F0 9F 98 B2 ] is U+1F632 ASTONISHED FACE
         public static void DecodeFromUtf8(byte[] data, OperationStatus expectedOperationStatus, int expectedRuneValue, int expectedBytesConsumed)
         {
-            Assert.Equal(expectedOperationStatus, Rune.DecodeFromUtf8(data, out Rune actualRune, out int actualBytesConsumed));
-            Assert.Equal(expectedRuneValue, actualRune.Value);
-            Assert.Equal(expectedBytesConsumed, actualBytesConsumed);
+            OperationStatus operationStatus = Rune.DecodeFromUtf8(data, out Rune actualRune, out int actualBytesConsumed);
+            Assert.Equal((expectedOperationStatus, expectedRuneValue, expectedBytesConsumed), (operationStatus, actualRune.Value, actualBytesConsumed));
         }
 
         [Theory]
@@ -263,9 +265,8 @@ namespace System.Text.Tests
         [InlineData(new byte[] { 0xF0, 0x9F, 0x98, }, OperationStatus.NeedMoreData, 0xFFFD, 3)] // [ F0 9F 98 ] is valid 3-byte start of 4-byte sequence
         public static void DecodeLastFromUtf8(byte[] data, OperationStatus expectedOperationStatus, int expectedRuneValue, int expectedBytesConsumed)
         {
-            Assert.Equal(expectedOperationStatus, Rune.DecodeLastFromUtf8(data, out Rune actualRune, out int actualBytesConsumed));
-            Assert.Equal(expectedRuneValue, actualRune.Value);
-            Assert.Equal(expectedBytesConsumed, actualBytesConsumed);
+            OperationStatus operationStatus = Rune.DecodeLastFromUtf8(data, out Rune actualRune, out int actualBytesConsumed);
+            Assert.Equal((expectedOperationStatus, expectedRuneValue, expectedBytesConsumed), (operationStatus, actualRune.Value, actualBytesConsumed));
         }
 
         [Theory]
